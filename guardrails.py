@@ -14,7 +14,9 @@ def days_since_delivery(order: dict[str, Any], today: date | None = None) -> int
     """Return number of days since the order was delivered."""
     if today is None:
         today = date.today()
-    delivered = order["delivered_date"]
+    delivered = order.get("delivered_date")
+    if not delivered:
+        raise RefundNotEligibleError("Order not yet delivered")
     if isinstance(delivered, str):
         delivered = datetime.fromisoformat(delivered).date()
     return (today - delivered).days

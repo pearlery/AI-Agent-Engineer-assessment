@@ -2,6 +2,15 @@
 
 E-commerce internal support agent with ReAct loop, hard-coded guardrails, and eval harness.
 
+## Seed data
+
+| Entity | Orders | Notes |
+|--------|--------|-------|
+| `jane@example.com` | 4 (#1042, #1055, #1018, #1077) | #1042 damaged, #1018 >30 days |
+| `john@example.com` | 3 (#1071, #1060, #1038) | Mixed eligibility for refund test |
+| `angry@example.com` | 1 (#1099) | Upset-customer scenario |
+| `nobody@example.com` | 0 | Explicit empty customer in `CUSTOMERS` |
+
 ## Quick start
 
 ```bash
@@ -9,12 +18,18 @@ pip install -r requirements.txt
 python eval.py          # run all tests (no API key needed)
 ```
 
-### Live agent (requires OpenAI API key)
+### Live agent (requires Gemini API key)
 
 ```bash
-set OPENAI_API_KEY=sk-...
-python main.py "What's the status of orders for jane@example.com?"
+set GEMINI_API_KEY=your-key-here
+python main.py          # interactive loop — rep types requests
+python main.py "What's the status of orders for jane@example.com?"  # one-shot
 ```
+
+Uses **Gemini 2.0 Flash** (`gemini-2.0-flash`). Get a free key at [Google AI Studio](https://aistudio.google.com/apikey).
+Also accepts `GOOGLE_API_KEY` as an alias.
+
+JSON structured logs go to **stderr**; agent response goes to **stdout**.
 
 ## Project structure
 
@@ -23,21 +38,11 @@ python main.py "What's the status of orders for jane@example.com?"
 | `tools.py` | Mock backend — 5 tools with seed data & 20% flaky `get_order` |
 | `guardrails.py` | Hard refund eligibility checks (not bypassable by LLM) |
 | `agent.py` | ReAct loop, retry logic, max-step protection |
-| `llm.py` | OpenAI adapter + `ScriptedLLM` for deterministic eval |
+| `llm.py` | Gemini 2.0 Flash adapter + `ScriptedLLM` for deterministic eval |
 | `eval.py` | 5 test cases + bonus guardrail/loop tests |
-| `main.py` | CLI entry point for live runs |
+| `main.py` | Interactive CLI (`input()` loop) + optional one-shot mode |
+| `logging_config.py` | JSON structured logging with `run_id` per agent run |
 | `PART_C.md` | Whiteboard discussion answers |
-
-## Seed data
-
-| Entity | Detail |
-|--------|--------|
-| `jane@example.com` | 2 orders (#1042 damaged, #1055 normal) |
-| `john@example.com` | 3 orders — mixed eligibility for "refund last 3" test |
-| `nobody@example.com` | 0 orders |
-| Order #1038 | Delivered 45 days ago → outside 30-day window |
-| Order #1042 | `damaged=True` → always refundable |
-| Order #1060 | `refundable=False` → blocked by guardrail |
 
 ## Test cases (eval.py)
 

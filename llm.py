@@ -1,4 +1,4 @@
-"""LLM adapters — OpenAI for production, ScriptedLLM for deterministic eval."""
+"""LLM adapters — Gemini 2.0 Flash for production, ScriptedLLM for eval."""
 
 from __future__ import annotations
 
@@ -7,6 +7,16 @@ import os
 import re
 from abc import ABC, abstractmethod
 from typing import Any
+
+GEMINI_MODEL = "gemini-2.5-flash"
+
+SYSTEM_INSTRUCTION = (
+    "You are an internal e-commerce support agent. "
+    "Use tools to look up orders, check refund policy before refunding, "
+    "and never issue a refund without verifying eligibility. "
+    "If a request is ambiguous (no order ID), ask a clarifying question "
+    "or escalate to a human — do not guess."
+)
 
 
 class LLM(ABC):
@@ -19,8 +29,45 @@ class LLM(ABC):
         """
 
 
+class GeminiLLM(LLM):
+    """Gemini 2.0 Flash via google-genai function calling."""
+
+    def __init__(self, model: str = GEMINI_MODEL, api_key: str | None = None):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise ImportError("Install google-genai: pip install google-genai") from exc
+
+        key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not key:
+            raise ValueError("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable")
+
+        self._genai = genai
+        self._types = types
+        self.client = genai.Client(api_key=key)
+        self.model = model
+
+    def decide(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        system, contents = _history_to_gemini(history, self._types)
+        gemini_tools = _tools_to_gemini(tools, self._types)
+
+        config = self._types.GenerateContentConfig(
+            tools=gemini_tools,
+            system_instruction=system or SYSTEM_INSTRUCTION,
+        )
+
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+
+        return _parse_gemini_response(response)
+
+
 class OpenAILLM(LLM):
-    """Real LLM via OpenAI function-calling."""
+    """Optional OpenAI adapter (fallback)."""
 
     def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
         try:
@@ -83,19 +130,94 @@ class ScriptedLLM(LLM):
         return {"type": "final_answer", "content": self.final_answer}
 
 
-def _history_to_openai_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": (
-                "You are an internal e-commerce support agent. "
-                "Use tools to look up orders, check refund policy before refunding, "
-                "and never issue a refund without verifying eligibility. "
-                "If a request is ambiguous (no order ID), ask a clarifying question "
-                "or escalate to a human — do not guess."
-            ),
-        }
+def get_default_llm() -> LLM:
+    """Return the production LLM (Gemini 2.0 Flash)."""
+    return GeminiLLM()
+
+
+def _history_to_gemini(history: list[dict[str, Any]], types: Any) -> tuple[str | None, list[Any]]:
+    system: str | None = None
+    contents: list[Any] = []
+
+    for entry in history:
+        role = entry.get("role")
+        if role == "system":
+            system = entry["content"]
+        elif role == "user":
+            contents.append(types.Content(role="user", parts=[types.Part(text=entry["content"])]))
+        elif role == "assistant":
+            contents.append(types.Content(role="model", parts=[types.Part(text=entry.get("content", ""))]))
+        elif role == "tool_call":
+            contents.append(
+                types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            function_call=types.FunctionCall(
+                                name=entry["name"],
+                                args=entry["arguments"],
+                            )
+                        )
+                    ],
+                )
+            )
+        elif role == "tool":
+            result = entry["result"]
+            if not isinstance(result, dict):
+                result = {"result": result}
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=entry["name"],
+                                response=result,
+                            )
+                        )
+                    ],
+                )
+            )
+
+    return system, contents
+
+
+def _tools_to_gemini(tools: list[dict[str, Any]], types: Any) -> list[Any]:
+    declarations = [
+        types.FunctionDeclaration(
+            name=t["name"],
+            description=t["description"],
+            parameters=t["parameters"],
+        )
+        for t in tools
     ]
+    return [types.Tool(function_declarations=declarations)]
+
+
+def _parse_gemini_response(response: Any) -> dict[str, Any]:
+    if not response.candidates:
+        return {"type": "final_answer", "content": ""}
+
+    content = response.candidates[0].content
+    if not content or not content.parts:
+        return {"type": "final_answer", "content": ""}
+
+    for part in content.parts:
+        if part.function_call:
+            args = part.function_call.args or {}
+            return {
+                "type": "tool_call",
+                "name": part.function_call.name,
+                "arguments": dict(args),
+            }
+        if part.text:
+            return {"type": "final_answer", "content": part.text}
+
+    return {"type": "final_answer", "content": ""}
+
+
+def _history_to_openai_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
     for entry in history:
         role = entry.get("role")

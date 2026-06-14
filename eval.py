@@ -233,6 +233,29 @@ def test_max_steps():
     check("escalates on max steps", "escalating" in run.response.lower() or run.called("escalate_to_human"))
 
 
+def test_bad_model_output():
+    print("\n[bonus] bad model output — malformed args coerced, agent does not crash")
+    reset_counters()
+    set_disable_random_failures(True)
+
+    # LLM sends order_id as int and amount as string — both common mistakes
+    llm = ScriptedLLM(
+        [
+            {"name": "get_refund_policy", "arguments": {}},
+            {"name": "get_order", "arguments": {"order_id": 1042}},          # int, not str
+            {"name": "issue_refund", "arguments": {
+                "order_id": "1042", "amount": "89.99", "reason": "damaged"   # amount as string
+            }},
+        ],
+        final_answer="Refund issued.",
+    )
+    run = agent("Refund order 1042 for jane.", llm=llm, today=_TODAY)
+
+    check("does not crash on int order_id", True)
+    check("does not crash on string amount", True)
+    check("refund succeeded after coercion", len(successful_refunds(run.tool_calls)) == 1)
+
+
 def test_issue_refund_schema():
     print("\n[bonus] issue_refund schema contains IRREVERSIBLE")
     from tools import TOOL_SCHEMAS
@@ -257,6 +280,7 @@ def main() -> int:
     test_timeout_retry_escalate()
     test_guardrails_unit()
     test_max_steps()
+    test_bad_model_output()
     test_issue_refund_schema()
 
     print("\n" + "=" * 60)

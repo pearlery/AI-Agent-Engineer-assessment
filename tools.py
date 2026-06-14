@@ -12,6 +12,14 @@ from typing import Any
 
 _TODAY = date(2026, 6, 14)
 
+# Explicit customer registry (emails with zero orders are listed with [])
+CUSTOMERS: dict[str, list[str]] = {
+    "jane@example.com": ["1042", "1055", "1018", "1077"],
+    "john@example.com": ["1071", "1060", "1038"],
+    "angry@example.com": ["1099"],
+    "nobody@example.com": [],
+}
+
 _ORDERS: dict[str, dict[str, Any]] = {
     "1042": {
         "order_id": "1042",
@@ -32,6 +40,39 @@ _ORDERS: dict[str, dict[str, Any]] = {
         "total": 25.98,
         "order_date": (_TODAY - timedelta(days=20)).isoformat(),
         "delivered_date": (_TODAY - timedelta(days=15)).isoformat(),
+        "refundable": True,
+        "damaged": False,
+    },
+    "1018": {
+        "order_id": "1018",
+        "customer_email": "jane@example.com",
+        "status": "delivered",
+        "items": [{"name": "Laptop Stand", "qty": 1, "price": 34.99}],
+        "total": 34.99,
+        "order_date": (_TODAY - timedelta(days=55)).isoformat(),
+        "delivered_date": (_TODAY - timedelta(days=40)).isoformat(),  # > 30 days
+        "refundable": True,
+        "damaged": False,
+    },
+    "1077": {
+        "order_id": "1077",
+        "customer_email": "jane@example.com",
+        "status": "shipped",
+        "items": [{"name": "Screen Protector", "qty": 1, "price": 14.99}],
+        "total": 14.99,
+        "order_date": (_TODAY - timedelta(days=3)).isoformat(),
+        "delivered_date": None,
+        "refundable": True,
+        "damaged": False,
+    },
+    "1099": {
+        "order_id": "1099",
+        "customer_email": "angry@example.com",
+        "status": "delivered",
+        "items": [{"name": "Gaming Mouse", "qty": 1, "price": 79.99}],
+        "total": 79.99,
+        "order_date": (_TODAY - timedelta(days=8)).isoformat(),
+        "delivered_date": (_TODAY - timedelta(days=3)).isoformat(),
         "refundable": True,
         "damaged": False,
     },
@@ -109,6 +150,9 @@ def reset_counters() -> None:
 
 def search_orders(customer_email: str) -> list[dict[str, Any]]:
     """Return all orders for a customer email."""
+    if customer_email not in CUSTOMERS:
+        return []
+
     results = [
         {
             "order_id": o["order_id"],

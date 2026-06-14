@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import date
 from typing import Any
 
 from guardrails import RefundNotEligibleError, validate_refund
-from llm import LLM, OpenAILLM, ScriptedLLM
+from logging_config import clear_run_id, set_run_id
+from llm import LLM, GeminiLLM, ScriptedLLM, get_default_llm
 from tools import (
     TOOL_SCHEMAS,
     escalate_to_human,
@@ -89,6 +91,21 @@ def get_order_with_retry(
     raise last_error  # unreachable, satisfies type checker
 
 
+def _coerce_args(name: str, args: dict[str, Any] | None) -> dict[str, Any]:
+    """Best-effort type coercion for common LLM argument mistakes."""
+    args = dict(args or {})
+    # order_id can arrive as int from some models
+    if "order_id" in args and args["order_id"] is not None:
+        args["order_id"] = str(args["order_id"])
+    # amount can arrive as a string "89.99"
+    if name == "issue_refund" and "amount" in args:
+        try:
+            args["amount"] = float(args["amount"])
+        except (ValueError, TypeError):
+            pass  # let downstream raise a clear error
+    return args
+
+
 def execute_tool(
     action: dict[str, Any],
     tool_calls_log: list[dict[str, Any]],
@@ -96,10 +113,16 @@ def execute_tool(
     today: date | None = None,
 ) -> dict[str, Any]:
     """Execute a tool call with guardrails and logging."""
-    name = action["name"]
-    args = action.get("arguments", {})
+    name = action.get("name") or ""
+    if not name:
+        result = {"error": "missing_tool_name", "message": "LLM returned tool call with no name"}
+        logger.error("missing_tool_name", extra={"action": action})
+        tool_calls_log.append({"name": "unknown", "arguments": {}, "result": result})
+        return {"role": "tool", "name": "unknown", "result": result}
 
-    logger.info("tool_call", extra={"tool": name, "args": args})
+    args = _coerce_args(name, action.get("arguments"))
+
+    logger.info("tool_call", extra={"tool": name, "tool_args": args})
 
     try:
         if name == "search_orders":
@@ -153,53 +176,70 @@ def run(
         set_disable_random_failures(True)
 
     if llm is None:
-        llm = OpenAILLM()
+        llm = get_default_llm()
 
-    history: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
-    tool_calls_log: list[dict[str, Any]] = []
-    steps = 0
-    done = False
-    response = ""
+    run_id = str(uuid.uuid4())
+    set_run_id(run_id)
+    logger.info("agent_run_started", extra={"user_message": user_message})
 
-    while not done and steps < MAX_STEPS:
-        action = llm.decide(history, TOOL_SCHEMAS)
-        logger.info("llm_action", extra={"step": steps, "action_type": action["type"]})
+    try:
+        history: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        tool_calls_log: list[dict[str, Any]] = []
+        steps = 0
+        done = False
+        response = ""
 
-        if action["type"] == "final_answer":
-            response = action["content"]
-            history.append({"role": "assistant", "content": response})
-            done = True
-            break
+        while not done and steps < MAX_STEPS:
+            action = llm.decide(history, TOOL_SCHEMAS)
+            logger.info("llm_action", extra={"step": steps, "action_type": action["type"]})
 
-        history.append(
-            {
-                "role": "tool_call",
-                "id": f"call_{steps}",
-                "name": action["name"],
-                "arguments": action["arguments"],
-            }
+            if action["type"] == "final_answer":
+                response = action["content"]
+                history.append({"role": "assistant", "content": response})
+                done = True
+                break
+
+            if action["type"] != "tool_call":
+                logger.warning("unknown_action_type", extra={"step": steps, "action_type": action.get("type")})
+                response = "Unexpected response from model — escalating to human"
+                done = True
+                break
+
+            history.append(
+                {
+                    "role": "tool_call",
+                    "id": f"call_{steps}",
+                    "name": action["name"],
+                    "arguments": action["arguments"],
+                }
+            )
+
+            tool_result = execute_tool(action, tool_calls_log, today=today)
+            history.append(tool_result)
+            steps += 1
+
+        if not done and steps >= MAX_STEPS:
+            ticket = escalate_to_human(None, "Max steps reached — agent loop exceeded limit")
+            tool_calls_log.append(
+                {
+                    "name": "escalate_to_human",
+                    "arguments": {"note": "Max steps reached"},
+                    "result": ticket,
+                }
+            )
+            response = "Max steps reached — escalating to human"
+            logger.warning("max_steps_reached", extra={"steps": steps})
+
+        logger.info(
+            "agent_run_finished",
+            extra={"steps": steps, "tool_call_count": len(tool_calls_log)},
         )
-
-        tool_result = execute_tool(action, tool_calls_log, today=today)
-        history.append(tool_result)
-        steps += 1
-
-    if not done and steps >= MAX_STEPS:
-        ticket = escalate_to_human(None, "Max steps reached — agent loop exceeded limit")
-        tool_calls_log.append(
-            {
-                "name": "escalate_to_human",
-                "arguments": {"note": "Max steps reached"},
-                "result": ticket,
-            }
-        )
-        response = "Max steps reached — escalating to human"
-        logger.warning("max_steps_reached", extra={"steps": steps})
-
-    return AgentRun(response=response, tool_calls=tool_calls_log, steps=steps, history=history)
+        return AgentRun(response=response, tool_calls=tool_calls_log, steps=steps, history=history)
+    finally:
+        clear_run_id()
 
 
 # Convenience alias used by eval.py
