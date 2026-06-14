@@ -28,9 +28,11 @@ MAX_STEPS = 10
 SYSTEM_PROMPT = (
     "You are an internal e-commerce support agent. "
     "Use tools to resolve support requests. "
-    "Always check get_refund_policy before issuing a refund. "
+    "If a customer email is mentioned but no order ID, call search_orders first to find their orders. "
+    "Always check get_refund_policy before issuing any refund. "
     "Verify each order's eligibility with get_order before calling issue_refund. "
-    "If the request is ambiguous (no order ID), ask for clarification or escalate — never guess."
+    "If the request mentions multiple orders, check each one individually with get_order. "
+    "If the request is ambiguous (no email and no order ID), ask for clarification or escalate — never guess."
 )
 
 
@@ -111,6 +113,7 @@ def execute_tool(
     tool_calls_log: list[dict[str, Any]],
     *,
     today: date | None = None,
+    order_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a tool call with guardrails and logging."""
     name = action.get("name") or ""
@@ -121,6 +124,8 @@ def execute_tool(
         return {"role": "tool", "name": "unknown", "result": result}
 
     args = _coerce_args(name, action.get("arguments"))
+    if order_cache is None:
+        order_cache = {}
 
     logger.info("tool_call", extra={"tool": name, "tool_args": args})
 
@@ -128,12 +133,17 @@ def execute_tool(
         if name == "search_orders":
             result = search_orders(args["customer_email"])
         elif name == "get_order":
-            result = get_order_with_retry(args["order_id"], tool_calls_log, today=today)
+            oid = args["order_id"]
+            if oid not in order_cache:
+                order_cache[oid] = get_order_with_retry(args["order_id"], tool_calls_log, today=today)
+            result = order_cache[oid]
             return {"role": "tool", "name": name, "result": result}
         elif name == "get_refund_policy":
             result = get_refund_policy()
         elif name == "issue_refund":
-            order = get_order_with_retry(args["order_id"], tool_calls_log, today=today)
+            oid = args["order_id"]
+            order = order_cache.get(oid) or get_order_with_retry(oid, tool_calls_log, today=today)
+            order_cache[oid] = order
             if "error" in order:
                 result = order
             else:
@@ -172,9 +182,6 @@ def run(
             history.append(result)
             steps += 1
     """
-    if disable_random_failures:
-        set_disable_random_failures(True)
-
     if llm is None:
         llm = get_default_llm()
 
@@ -182,12 +189,14 @@ def run(
     set_run_id(run_id)
     logger.info("agent_run_started", extra={"user_message": user_message})
 
+    set_disable_random_failures(disable_random_failures)
     try:
         history: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ]
         tool_calls_log: list[dict[str, Any]] = []
+        order_cache: dict[str, Any] = {}
         steps = 0
         done = False
         response = ""
@@ -217,7 +226,7 @@ def run(
                 }
             )
 
-            tool_result = execute_tool(action, tool_calls_log, today=today)
+            tool_result = execute_tool(action, tool_calls_log, today=today, order_cache=order_cache)
             history.append(tool_result)
             steps += 1
 
@@ -239,6 +248,7 @@ def run(
         )
         return AgentRun(response=response, tool_calls=tool_calls_log, steps=steps, history=history)
     finally:
+        set_disable_random_failures(False)  # always restore default
         clear_run_id()
 
 

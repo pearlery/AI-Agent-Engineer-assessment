@@ -16,6 +16,17 @@ from logging_config import setup_logging
 logger = logging.getLogger(__name__)
 
 
+def _friendly_error(exc: Exception) -> str:
+    msg = str(exc)
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return "API rate limit reached. Please wait a moment and try again."
+    if "503" in msg or "UNAVAILABLE" in msg:
+        return "LLM service temporarily unavailable. Please try again shortly."
+    if "401" in msg or "403" in msg or "API_KEY" in msg.upper():
+        return "API key error. Please check your GEMINI_API_KEY."
+    return msg.split("\n")[0]  # first line only for other errors
+
+
 def run_once(message: str, *, show_json: bool = False) -> int:
     run = agent(message, llm=get_default_llm())
 
@@ -64,7 +75,8 @@ def interactive_loop() -> int:
             run_once(message)
         except Exception as exc:
             logger.exception("agent_error", extra={"error": str(exc)})
-            print(f"\nAgent> Sorry, something went wrong: {exc}")
+            friendly = _friendly_error(exc)
+            print(f"\nAgent> Sorry, something went wrong: {friendly}")
 
     return 0
 
