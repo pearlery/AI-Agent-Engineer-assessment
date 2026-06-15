@@ -24,26 +24,44 @@ from tools import (
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 10
+MAX_INPUT_TOKENS = 100_000  # cost ceiling — escalate if a single run burns too much
 
-SYSTEM_PROMPT = (
-    "You are an internal e-commerce support agent. "
-    "Use tools to resolve support requests. "
-    "If a customer email is mentioned but no order ID, call search_orders first to find their orders. "
-    "Always check get_refund_policy before issuing any refund. "
-    "Verify each order's eligibility with get_order before calling issue_refund. "
-    "If the request mentions multiple orders, check each one individually with get_order. "
-    "If the request is ambiguous (no email and no order ID), ask for clarification or escalate — never guess."
-)
+def _build_system_prompt(today: date) -> str:
+    return (
+        f"Today's date is {today.isoformat()}. "
+        "You are an internal e-commerce support agent. "
+        "Use tools to resolve support requests. "
+        "If a customer email is mentioned but no order ID, call search_orders first to find their orders. "
+        "Always check get_refund_policy before issuing any refund. "
+        "Verify each order's eligibility with get_order before calling issue_refund. "
+        "An order is eligible for refund if: (a) it is damaged, OR "
+        "(b) it was delivered within 30 days of today AND refundable=true. "
+        "Calculate days since delivery as: today minus delivered_date. "
+        "If the request mentions multiple orders, check each one individually. "
+        "When a support rep gives a clear instruction to refund a specific order, "
+        "proceed with the refund after verifying eligibility — do not ask for confirmation. "
+        "If the request is ambiguous (no email and no order ID), ask for clarification or escalate — never guess."
+    )
 
 
 class AgentRun:
     """Result of a single agent run with full observability."""
 
-    def __init__(self, response: str, tool_calls: list[dict[str, Any]], steps: int, history: list[dict[str, Any]]):
+    def __init__(
+        self,
+        response: str,
+        tool_calls: list[dict[str, Any]],
+        steps: int,
+        history: list[dict[str, Any]],
+        total_input_tokens: int = 0,
+        total_output_tokens: int = 0,
+    ):
         self.response = response
         self.tool_calls = tool_calls
         self.steps = steps
         self.history = history
+        self.total_input_tokens = total_input_tokens
+        self.total_output_tokens = total_output_tokens
 
     def called(self, tool_name: str) -> bool:
         return any(c["name"] == tool_name for c in self.tool_calls)
@@ -189,10 +207,11 @@ def run(
     set_run_id(run_id)
     logger.info("agent_run_started", extra={"user_message": user_message})
 
+    today_date = today or date.today()
     set_disable_random_failures(disable_random_failures)
     try:
         history: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _build_system_prompt(today_date)},
             {"role": "user", "content": user_message},
         ]
         tool_calls_log: list[dict[str, Any]] = []
@@ -200,10 +219,28 @@ def run(
         steps = 0
         done = False
         response = ""
+        input_tokens = 0
+        output_tokens = 0
 
         while not done and steps < MAX_STEPS:
             action = llm.decide(history, TOOL_SCHEMAS)
-            logger.info("llm_action", extra={"step": steps, "action_type": action["type"]})
+            usage = action.pop("usage", {})
+            input_tokens += usage.get("input_tokens", 0)
+            output_tokens += usage.get("output_tokens", 0)
+            logger.info("llm_action", extra={"step": steps, "action_type": action["type"],
+                                              "input_tokens": input_tokens, "output_tokens": output_tokens})
+
+            if input_tokens > MAX_INPUT_TOKENS:
+                ticket = escalate_to_human(None, f"Token budget exceeded: {input_tokens} input tokens")
+                tool_calls_log.append({
+                    "name": "escalate_to_human",
+                    "arguments": {"note": "Token budget exceeded"},
+                    "result": ticket,
+                })
+                response = "Token budget exceeded — escalating to human"
+                logger.warning("token_budget_exceeded", extra={"input_tokens": input_tokens})
+                done = True
+                break
 
             if action["type"] == "final_answer":
                 response = action["content"]
@@ -223,30 +260,41 @@ def run(
                     "id": f"call_{steps}",
                     "name": action["name"],
                     "arguments": action["arguments"],
+                    "_raw_content": action.get("_raw_content"),
                 }
             )
 
-            tool_result = execute_tool(action, tool_calls_log, today=today, order_cache=order_cache)
+            tool_result = execute_tool(action, tool_calls_log, today=today_date, order_cache=order_cache)
             history.append(tool_result)
             steps += 1
 
         if not done and steps >= MAX_STEPS:
             ticket = escalate_to_human(None, "Max steps reached — agent loop exceeded limit")
-            tool_calls_log.append(
-                {
-                    "name": "escalate_to_human",
-                    "arguments": {"note": "Max steps reached"},
-                    "result": ticket,
-                }
-            )
+            tool_calls_log.append({
+                "name": "escalate_to_human",
+                "arguments": {"note": "Max steps reached"},
+                "result": ticket,
+            })
             response = "Max steps reached — escalating to human"
             logger.warning("max_steps_reached", extra={"steps": steps})
 
         logger.info(
             "agent_run_finished",
-            extra={"steps": steps, "tool_call_count": len(tool_calls_log)},
+            extra={
+                "steps": steps,
+                "tool_call_count": len(tool_calls_log),
+                "total_input_tokens": input_tokens,
+                "total_output_tokens": output_tokens,
+            },
         )
-        return AgentRun(response=response, tool_calls=tool_calls_log, steps=steps, history=history)
+        return AgentRun(
+            response=response,
+            tool_calls=tool_calls_log,
+            steps=steps,
+            history=history,
+            total_input_tokens=input_tokens,
+            total_output_tokens=output_tokens,
+        )
     finally:
         set_disable_random_failures(False)  # always restore default
         clear_run_id()

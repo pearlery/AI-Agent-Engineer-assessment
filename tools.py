@@ -225,13 +225,17 @@ def escalate_to_human(order_id: str | None, note: str) -> dict[str, Any]:
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "search_orders",
-        "description": "Search for all orders belonging to a customer by email address.",
+        "description": (
+            "Search for all orders belonging to a customer by email address. "
+            "Use this whenever a customer email is mentioned but no order ID is given."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "customer_email": {
                     "type": "string",
-                    "description": "Customer email address",
+                    "format": "email",
+                    "description": "Customer email address (e.g. jane@example.com)",
                 }
             },
             "required": ["customer_email"],
@@ -239,13 +243,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "get_order",
-        "description": "Get full details for a single order including delivery date and refund eligibility flags.",
+        "description": (
+            "Get full order details including delivered_date, refundable flag, and damaged flag. "
+            "Must be called before issue_refund to verify eligibility."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "order_id": {
                     "type": "string",
-                    "description": "Order ID (e.g. '1042' or '#1042')",
+                    "pattern": "^#?[0-9]+$",
+                    "description": "Order ID — digits only, with or without leading # (e.g. '1042' or '#1042')",
                 }
             },
             "required": ["order_id"],
@@ -253,29 +261,48 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "get_refund_policy",
-        "description": "Retrieve the current refund policy. Call this before issuing any refund.",
+        "description": (
+            "Retrieve the current refund policy text. "
+            "Always call this before issuing any refund."
+        ),
         "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "issue_refund",
         "description": (
             "IRREVERSIBLE — Issue a monetary refund for an order. "
-            "This action cannot be undone. Only call after verifying eligibility "
-            "via get_order and get_refund_policy."
+            "This action cannot be undone and should NOT be called lightly. "
+            "Prerequisites: call get_refund_policy and get_order first, "
+            "confirm the order is within the 30-day window or is damaged."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "order_id": {"type": "string", "description": "Order ID to refund"},
-                "amount": {"type": "number", "description": "Refund amount in USD"},
-                "reason": {"type": "string", "description": "Reason for the refund"},
+                "order_id": {
+                    "type": "string",
+                    "pattern": "^#?[0-9]+$",
+                    "description": "Order ID to refund",
+                },
+                "amount": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Refund amount in USD — must match the order total unless partial refund",
+                },
+                "reason": {
+                    "type": "string",
+                    "minLength": 5,
+                    "description": "Clear reason for the refund (e.g. 'damaged item', 'outside 30-day window exception')",
+                },
             },
             "required": ["order_id", "amount", "reason"],
         },
     },
     {
         "name": "escalate_to_human",
-        "description": "Escalate a case to a human support agent when the request is ambiguous or tools fail.",
+        "description": (
+            "File a support ticket for a human agent. Use when: request is ambiguous, "
+            "tools fail after retries, or the case requires judgment beyond policy."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -283,7 +310,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Related order ID, if known",
                 },
-                "note": {"type": "string", "description": "Context for the human agent"},
+                "note": {
+                    "type": "string",
+                    "minLength": 10,
+                    "description": "Context for the human agent — include what was attempted and why escalating",
+                },
             },
             "required": ["note"],
         },

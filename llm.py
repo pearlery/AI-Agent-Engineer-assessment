@@ -32,7 +32,7 @@ class LLM(ABC):
 
 
 class GeminiLLM(LLM):
-    """Gemini 2.0 Flash via google-genai function calling."""
+    """Gemini 2.5 Flash via google-genai function calling."""
 
     def __init__(self, model: str = GEMINI_MODEL, api_key: str | None = None):
         try:
@@ -54,10 +54,17 @@ class GeminiLLM(LLM):
         system, contents = _history_to_gemini(history, self._types)
         gemini_tools = _tools_to_gemini(tools, self._types)
 
-        config = self._types.GenerateContentConfig(
-            tools=gemini_tools,
-            system_instruction=system or SYSTEM_INSTRUCTION,
-        )
+        config_kwargs: dict[str, Any] = {
+            "tools": gemini_tools,
+            "system_instruction": system or SYSTEM_INSTRUCTION,
+        }
+        # Disable thinking for models that support it — thought_signature
+        # is not preserved across turns in our history format.
+        try:
+            config_kwargs["thinking_config"] = self._types.ThinkingConfig(thinking_budget=0)
+        except AttributeError:
+            pass
+        config = self._types.GenerateContentConfig(**config_kwargs)
 
         response = self.client.models.generate_content(
             model=self.model,
@@ -65,7 +72,17 @@ class GeminiLLM(LLM):
             config=config,
         )
 
-        return _parse_gemini_response(response)
+        action = _parse_gemini_response(response)
+        meta = response.usage_metadata
+        if meta:
+            action["usage"] = {
+                "input_tokens": meta.prompt_token_count or 0,
+                "output_tokens": meta.candidates_token_count or 0,
+            }
+        # Preserve raw content so thought_signature survives multi-turn history
+        if response.candidates:
+            action["_raw_content"] = response.candidates[0].content
+        return action
 
 
 class OpenAILLM(LLM):
@@ -128,12 +145,12 @@ class ScriptedLLM(LLM):
         if self._step < len(self.script):
             action = self.script[self._step]
             self._step += 1
-            return {"type": "tool_call", **action}
-        return {"type": "final_answer", "content": self.final_answer}
+            return {"type": "tool_call", "usage": {}, **action}
+        return {"type": "final_answer", "content": self.final_answer, "usage": {}}
 
 
 def get_default_llm() -> LLM:
-    """Return the production LLM (Gemini 2.0 Flash)."""
+    """Return the production LLM (Gemini 2.5 Flash)."""
     return GeminiLLM()
 
 
@@ -150,19 +167,24 @@ def _history_to_gemini(history: list[dict[str, Any]], types: Any) -> tuple[str |
         elif role == "assistant":
             contents.append(types.Content(role="model", parts=[types.Part(text=entry.get("content", ""))]))
         elif role == "tool_call":
-            contents.append(
-                types.Content(
-                    role="model",
-                    parts=[
-                        types.Part(
-                            function_call=types.FunctionCall(
-                                name=entry["name"],
-                                args=entry["arguments"],
+            raw = entry.get("_raw_content")
+            if raw is not None:
+                # Use the original response content so thought_signature is preserved
+                contents.append(raw)
+            else:
+                contents.append(
+                    types.Content(
+                        role="model",
+                        parts=[
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    name=entry["name"],
+                                    args=entry["arguments"],
+                                )
                             )
-                        )
-                    ],
+                        ],
+                    )
                 )
-            )
         elif role == "tool":
             result = entry["result"]
             if not isinstance(result, dict):

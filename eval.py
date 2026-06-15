@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from datetime import date
 
-from agent import MAX_STEPS, agent, get_order_with_retry
+from agent import MAX_STEPS, MAX_INPUT_TOKENS, agent, get_order_with_retry
 from guardrails import RefundNotEligibleError, validate_refund
 from llm import ScriptedLLM
 from tools import (
@@ -233,6 +233,31 @@ def test_max_steps():
     check("escalates on max steps", "escalating" in run.response.lower() or run.called("escalate_to_human"))
 
 
+def test_token_budget_ceiling():
+    print("\n[bonus] token budget ceiling — escalates when input_tokens > MAX_INPUT_TOKENS")
+    reset_counters()
+    set_disable_random_failures(True)
+
+    class BudgetBlowingLLM:
+        """Returns a tool_call but reports MAX_INPUT_TOKENS+1 tokens used on first call."""
+        def __init__(self):
+            self._step = 0
+
+        def decide(self, history, tools):
+            self._step += 1
+            return {
+                "type": "tool_call",
+                "name": "get_refund_policy",
+                "arguments": {},
+                "usage": {"input_tokens": MAX_INPUT_TOKENS + 1, "output_tokens": 0},
+            }
+
+    run = agent("Check policy forever.", llm=BudgetBlowingLLM(), today=_TODAY)
+    check("escalates on token budget exceeded", run.called("escalate_to_human"))
+    check("stops after 1 step (not MAX_STEPS)", run.steps <= 1)
+    check("response mentions budget/escalating", "escalat" in run.response.lower())
+
+
 def test_bad_model_output():
     print("\n[bonus] bad model output — malformed args coerced, agent does not crash")
     reset_counters()
@@ -280,6 +305,7 @@ def main() -> int:
     test_timeout_retry_escalate()
     test_guardrails_unit()
     test_max_steps()
+    test_token_budget_ceiling()
     test_bad_model_output()
     test_issue_refund_schema()
 

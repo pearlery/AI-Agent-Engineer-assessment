@@ -28,7 +28,12 @@ def _friendly_error(exc: Exception) -> str:
 
 
 def run_once(message: str, *, show_json: bool = False) -> int:
-    run = agent(message, llm=get_default_llm())
+    try:
+        run = agent(message, llm=get_default_llm())
+    except Exception as exc:
+        logger.exception("agent_error", extra={"error": str(exc)})
+        print(f"\nAgent> Sorry, something went wrong: {_friendly_error(exc)}")
+        return 1
 
     if show_json:
         print(
@@ -37,6 +42,8 @@ def run_once(message: str, *, show_json: bool = False) -> int:
                     "response": run.response,
                     "steps": run.steps,
                     "tool_calls": run.tool_calls,
+                    "total_input_tokens": run.total_input_tokens,
+                    "total_output_tokens": run.total_output_tokens,
                 },
                 indent=2,
                 default=str,
