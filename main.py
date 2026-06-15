@@ -60,7 +60,7 @@ def run_once(message: str, *, show_json: bool = False) -> int:
 
 
 def interactive_loop() -> int:
-    print("E-commerce Support Agent (Gemini 2.5 Flash)")
+    print("E-commerce Support Agent (Qwen3-235B via OpenRouter)")
     print("Type a support request in plain English.")
     print("Commands: quit / exit / q to leave\n")
 

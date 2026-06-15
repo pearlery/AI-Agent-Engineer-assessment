@@ -1,4 +1,4 @@
-"""LLM adapters — Gemini 2.0 Flash for production, ScriptedLLM for eval."""
+"""LLM adapters — OpenRouter Qwen3-235B for production, ScriptedLLM for eval."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 GEMINI_MODEL = "gemini-2.5-flash"
+OPENROUTER_MODEL = "qwen/qwen3-235b-a22b-2507"
 
 SYSTEM_INSTRUCTION = (
     "You are an internal e-commerce support agent. "
@@ -31,8 +32,56 @@ class LLM(ABC):
         """
 
 
+class OpenRouterLLM(LLM):
+    """Qwen3-235B-A22B-Instruct-2507 via OpenRouter (OpenAI-compatible endpoint)."""
+
+    BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(self, model: str = OPENROUTER_MODEL, api_key: str | None = None):
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError("Install openai: pip install openai") from exc
+
+        key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise ValueError("Set OPENROUTER_API_KEY environment variable")
+
+        self.client = OpenAI(api_key=key, base_url=self.BASE_URL)
+        self.model = model
+
+    def decide(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        messages = _history_to_openai_messages(history)
+        openai_tools = _tools_to_openai(tools)
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+        )
+        message = response.choices[0].message
+
+        usage: dict[str, int] = {}
+        if response.usage:
+            usage = {
+                "input_tokens": response.usage.prompt_tokens or 0,
+                "output_tokens": response.usage.completion_tokens or 0,
+            }
+
+        if message.tool_calls:
+            call = message.tool_calls[0]
+            return {
+                "type": "tool_call",
+                "name": call.function.name,
+                "arguments": json.loads(call.function.arguments),
+                "usage": usage,
+            }
+        return {"type": "final_answer", "content": message.content or "", "usage": usage}
+
+
 class GeminiLLM(LLM):
-    """Gemini 2.5 Flash via google-genai function calling."""
+    """Gemini 2.5 Flash via google-genai function calling (fallback)."""
 
     def __init__(self, model: str = GEMINI_MODEL, api_key: str | None = None):
         try:
@@ -58,8 +107,6 @@ class GeminiLLM(LLM):
             "tools": gemini_tools,
             "system_instruction": system or SYSTEM_INSTRUCTION,
         }
-        # Disable thinking for models that support it — thought_signature
-        # is not preserved across turns in our history format.
         try:
             config_kwargs["thinking_config"] = self._types.ThinkingConfig(thinking_budget=0)
         except AttributeError:
@@ -79,55 +126,9 @@ class GeminiLLM(LLM):
                 "input_tokens": meta.prompt_token_count or 0,
                 "output_tokens": meta.candidates_token_count or 0,
             }
-        # Preserve raw content so thought_signature survives multi-turn history
         if response.candidates:
             action["_raw_content"] = response.candidates[0].content
         return action
-
-
-class OpenAILLM(LLM):
-    """Optional OpenAI adapter (fallback)."""
-
-    def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError("Install openai: pip install openai") from exc
-
-        self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
-        self.model = model
-
-    def decide(self, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
-        messages = _history_to_openai_messages(history)
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["parameters"],
-                },
-            }
-            for t in tools
-        ]
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=openai_tools,
-            tool_choice="auto",
-        )
-        message = response.choices[0].message
-
-        if message.tool_calls:
-            call = message.tool_calls[0]
-            return {
-                "type": "tool_call",
-                "name": call.function.name,
-                "arguments": json.loads(call.function.arguments),
-            }
-
-        return {"type": "final_answer", "content": message.content or ""}
 
 
 class ScriptedLLM(LLM):
@@ -150,7 +151,9 @@ class ScriptedLLM(LLM):
 
 
 def get_default_llm() -> LLM:
-    """Return the production LLM (Gemini 2.5 Flash)."""
+    """Prefer OpenRouter (Qwen3-235B) when key is available, fall back to Gemini."""
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return OpenRouterLLM()
     return GeminiLLM()
 
 
@@ -169,7 +172,6 @@ def _history_to_gemini(history: list[dict[str, Any]], types: Any) -> tuple[str |
         elif role == "tool_call":
             raw = entry.get("_raw_content")
             if raw is not None:
-                # Use the original response content so thought_signature is preserved
                 contents.append(raw)
             else:
                 contents.append(
@@ -240,23 +242,31 @@ def _parse_gemini_response(response: Any) -> dict[str, Any]:
     return {"type": "final_answer", "content": ""}
 
 
+def _tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["parameters"],
+            },
+        }
+        for t in tools
+    ]
+
+
 def _history_to_openai_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+    messages: list[dict[str, Any]] = []
 
     for entry in history:
         role = entry.get("role")
-        if role == "user":
+        if role == "system":
+            messages.append({"role": "system", "content": entry["content"]})
+        elif role == "user":
             messages.append({"role": "user", "content": entry["content"]})
         elif role == "assistant":
             messages.append({"role": "assistant", "content": entry.get("content", "")})
-        elif role == "tool":
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": entry.get("tool_call_id", "call_0"),
-                    "content": json.dumps(entry["result"]),
-                }
-            )
         elif role == "tool_call":
             messages.append(
                 {
@@ -274,6 +284,18 @@ def _history_to_openai_messages(history: list[dict[str, Any]]) -> list[dict[str,
                     ],
                 }
             )
+        elif role == "tool":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": entry.get("id", "call_0"),
+                    "content": json.dumps(entry["result"]),
+                }
+            )
+
+    # Ensure system message is always first
+    if not messages or messages[0]["role"] != "system":
+        messages.insert(0, {"role": "system", "content": SYSTEM_INSTRUCTION})
 
     return messages
 
